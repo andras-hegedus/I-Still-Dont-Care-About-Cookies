@@ -512,6 +512,12 @@
   const searchPairsJoinedKeys = searchPairsKeys.join(",");
   let timeoutDuration = 0;
 
+  // A search group only needs to be queried again after the DOM has changed
+  const dirtyGroups = new Array(searchGroupsLength).fill(true);
+  const observer = new MutationObserver(function () {
+    dirtyGroups.fill(true);
+  });
+
   function searchLoop(counter) {
     setTimeout(function () {
       timeoutDuration = 50;
@@ -548,7 +554,6 @@
                       }
                     }, 150);
                   }
-                  console.log("Timeout for element click:", timeoutDuration);
                   timeoutDuration += 150;
                 }
               });
@@ -556,8 +561,16 @@
         });
       });
 
+      const group = counter % searchGroupsLength;
+
+      if (!dirtyGroups[group]) {
+        return next(counter);
+      }
+
+      dirtyGroups[group] = false;
+
       document
-        .querySelectorAll(searchGroups[counter % searchGroupsLength])
+        .querySelectorAll(searchGroups[group])
         .forEach(function (element) {
           if (element.click && !element.classList.contains("idcac")) {
             element.classList.add("idcac");
@@ -581,15 +594,20 @@
               }
             }, 300);
 
-            console.log("Timeout for element click:", timeoutDuration);
             timeoutDuration += 100;
           }
         });
 
-      if (counter < 100 * searchGroupsLength) {
-        searchLoop(counter + 1);
-      }
+      next(counter);
     }, timeoutDuration);
+  }
+
+  function next(counter) {
+    if (counter < 100 * searchGroupsLength) {
+      searchLoop(counter + 1);
+    } else {
+      observer.disconnect();
+    }
   }
 
   const start = setInterval(function () {
@@ -600,6 +618,11 @@
     }
 
     html.className += " idc0_343";
+    observer.observe(document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+    });
     searchLoop(0);
     clearInterval(start);
   }, 250);

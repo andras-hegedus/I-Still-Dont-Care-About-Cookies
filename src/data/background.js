@@ -4,8 +4,9 @@ let initialized = false;
 let cachedRules = {};
 let tabList = {};
 const xmlTabs = {};
-let lastDeclarativeNetRuleId = 1;
 let settings = { statusIndicators: true, whitelistedDomains: {} };
+let initializing = null;
+let whitelistRulesUpdate = Promise.resolve();
 const isManifestV3 = chrome.runtime.getManifest().manifest_version == 3;
 
 // Badges
@@ -51,7 +52,6 @@ function getHostname(url, cleanup) {
 // Whitelisting
 function updateSettings() {
   return new Promise((resolve) => {
-    lastDeclarativeNetRuleId = 1;
     chrome.storage.local.get(
       { settings: { whitelistedDomains: {}, statusIndicators: true } },
       async ({ settings: storedSettings }) => {
@@ -66,11 +66,20 @@ function updateSettings() {
   });
 }
 
-async function updateWhitelistRules() {
+// Serialized so concurrent updates can't add rules with the same id
+function updateWhitelistRules() {
+  whitelistRulesUpdate = whitelistRulesUpdate
+    .then(replaceWhitelistRules)
+    .catch((error) => console.error(error));
+  return whitelistRulesUpdate;
+}
+
+async function replaceWhitelistRules() {
   if (!isManifestV3) {
     console.warn("Called unsupported function");
     return;
   }
+  let ruleId = 1;
   const previousRules = (
     await chrome.declarativeNetRequest.getDynamicRules()
   ).map((v) => {
@@ -80,7 +89,7 @@ async function updateWhitelistRules() {
     .filter((element) => element[1])
     .map((v) => {
       return {
-        id: lastDeclarativeNetRuleId++,
+        id: ruleId++,
         priority: 1,
         action: { type: "allow" },
         condition: {
@@ -91,7 +100,7 @@ async function updateWhitelistRules() {
       };
     });
 
-  chrome.declarativeNetRequest.updateDynamicRules({
+  await chrome.declarativeNetRequest.updateDynamicRules({
     addRules,
     removeRuleIds: previousRules,
   });
@@ -131,18 +140,20 @@ async function toggleWhitelist(tab) {
   }
 
   if (tabList[tab.id].whitelisted) {
-    // const hostname = getWhitelistedDomain(tabList[tab.id]);
-    delete settings.whitelistedDomains[tabList[tab.id].hostname];
+    // May be whitelisted through a parent domain, e.g. example.com for a.example.com
+    delete settings.whitelistedDomains[getWhitelistedDomain(tabList[tab.id])];
   } else {
     settings.whitelistedDomains[tabList[tab.id].hostname] = true;
   }
-  chrome.storage.local.set({ settings }, function () {
-    for (const i in tabList) {
-      if (tabList[i].hostname == tabList[tab.id].hostname) {
-        tabList[i].whitelisted = !tabList[tab.id].whitelisted;
-      }
-    }
-  });
+
+  for (const i in tabList) {
+    tabList[i].whitelisted = tabList[i].hostname
+      ? isWhitelisted(tabList[i])
+      : false;
+  }
+
+  await chrome.storage.local.set({ settings });
+
   if (isManifestV3) {
     await updateWhitelistRules();
   }
@@ -423,9 +434,12 @@ function getBrowserAndVersion() {
   if (useragent.includes("Firefox")) {
     return useragent.match(/Firefox\/([0-9]+[\S]+)/)[0].replace("/", " ");
   } else if (useragent.includes("Chrome")) {
-    if (navigator.userAgentData.brands.length > 2) {
-      const { brand, version } = navigator.userAgentData.brands[1];
-      return brand + " " + version;
+    // Skip the "Not A Brand" GREASE entry and the generic Chromium entry
+    const brand = (navigator.userAgentData?.brands ?? []).find(
+      ({ brand }) => !/Not.?A.?Brand|Chromium/i.test(brand)
+    );
+    if (brand) {
+      return brand.brand + " " + brand.version;
     }
   }
   return "Other";
@@ -556,12 +570,20 @@ chrome.webNavigation.onCompleted.addListener(async function (tab) {
 // Toolbar menu
 
 chrome.runtime.onMessage.addListener((request, info, sendResponse) => {
-  initialize().then(() => {
+  // Sent by content scripts, possibly many times per page: keep it cheap
+  if (request?.command == "cookie_warning_dismissed") {
+    if (info.tab) {
+      setSuccessBadge(info.tab.id);
+    }
+    return false;
+  }
+
+  initialize(true).then(() => {
     let responseSend = false;
     if (typeof request == "object") {
       if (request.tabId && tabList[request.tabId]) {
         if (request.command == "get_active_tab") {
-          const response = { tab: tabList[request.tabId] };
+          const response = { tab: { ...tabList[request.tabId] } };
 
           if (response.tab.whitelisted) {
             response.tab.hostname = getWhitelistedDomain(
@@ -571,7 +593,8 @@ chrome.runtime.onMessage.addListener((request, info, sendResponse) => {
           sendResponse(response);
           responseSend = true;
         } else if (request.command == "toggle_extension") {
-          toggleWhitelist(tabList[request.tabId]);
+          toggleWhitelist(tabList[request.tabId]).then(() => sendResponse());
+          responseSend = true;
         } else if (request.command == "report_website") {
           reportWebsite(
             info,
@@ -672,10 +695,24 @@ async function initialize(checkInitialized, magic) {
   if (checkInitialized && initialized) {
     return;
   }
-  loadCachedRules();
-  await updateSettings();
-  await recreateTabList(magic);
-  initialized = true;
+  // Share a pending initialization instead of starting a second one
+  if (initializing) {
+    await initializing;
+    if (!magic) {
+      return;
+    }
+  }
+  initializing = (async () => {
+    loadCachedRules();
+    await updateSettings();
+    await recreateTabList(magic);
+    initialized = true;
+  })();
+  try {
+    await initializing;
+  } finally {
+    initializing = null;
+  }
 }
 
 initialize();

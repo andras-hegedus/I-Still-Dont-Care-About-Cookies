@@ -30,7 +30,6 @@
   },
   "dependencies": {
     "acorn": "^8.15.0",
-    "commander": "^14.0.1",
-    "packages": "^0.0.8"
+    "commander": "^14.0.1"
   }
 }
